@@ -64,6 +64,7 @@ const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+export const STRANDED_RECOVERY_REOPEN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -466,6 +467,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       )
       .limit(1)
       .then((rows) => Boolean(rows[0]));
+  }
+
+  async function hasPendingWakeAssigneeInteraction(companyId: string, issueId: string) {
+    return db
+      .select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, companyId),
+          eq(issueThreadInteractions.issueId, issueId),
+          eq(issueThreadInteractions.status, "pending"),
+          inArray(issueThreadInteractions.continuationPolicy, [
+            "wake_assignee",
+            "wake_assignee_on_accept",
+          ]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  function isHumanOwnerPlaceholderAgent(agent: typeof agents.$inferSelect | null | undefined) {
+    return Boolean(agent && agent.adapterType === "process" && agent.status === "error");
   }
 
   async function enqueueStrandedIssueRecovery(input: {
@@ -1345,6 +1369,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
   }
 
+  async function findRecentlyClosedStrandedIssueRecoveryIssue(
+    companyId: string,
+    sourceIssueId: string,
+    cooldownMs: number,
+  ) {
+    const cutoff = new Date(Date.now() - cooldownMs);
+    return db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STRANDED_ISSUE_RECOVERY_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          inArray(issues.status, ["done", "cancelled"]),
+          gt(issues.updatedAt, cutoff),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   function isStrandedIssueRecoveryIssue(issue: typeof issues.$inferSelect) {
     return issue.originKind === STRANDED_ISSUE_RECOVERY_ORIGIN_KIND;
   }
@@ -1491,6 +1543,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
     if (existing) return existing;
+
+    const recentlyClosed = await findRecentlyClosedStrandedIssueRecoveryIssue(
+      input.issue.companyId,
+      input.issue.id,
+      STRANDED_RECOVERY_REOPEN_COOLDOWN_MS,
+    );
+    if (recentlyClosed) {
+      logger.info(
+        {
+          companyId: input.issue.companyId,
+          sourceIssueId: input.issue.id,
+          priorRecoveryIssueId: recentlyClosed.id,
+          priorRecoveryStatus: recentlyClosed.status,
+          priorRecoveryUpdatedAt: recentlyClosed.updatedAt,
+          cooldownMs: STRANDED_RECOVERY_REOPEN_COOLDOWN_MS,
+        },
+        "recovery: skipped (cooldown: recent close)",
+      );
+      return null;
+    }
 
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     if (!ownerAgentId) return null;
@@ -1781,7 +1853,118 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  async function reapFalsePositiveStrandedRecoveryIssues() {
+    const openRecoveries = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.originKind, STRANDED_ISSUE_RECOVERY_ORIGIN_KIND),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+
+    const result = {
+      reaped: 0,
+      skipped: 0,
+      blockerRelationsRemoved: 0,
+      reapedIssueIds: [] as string[],
+    };
+
+    for (const recovery of openRecoveries) {
+      const sourceIssueId = readNonEmptyString(recovery.originId);
+      if (!sourceIssueId) {
+        result.skipped += 1;
+        continue;
+      }
+      const source = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, recovery.companyId), eq(issues.id, sourceIssueId)))
+        .then((rows) => rows[0] ?? null);
+      if (!source) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const sourceAssignee = source.assigneeAgentId ? await getAgent(source.assigneeAgentId) : null;
+      const hasLiveInteraction = await hasPendingWakeAssigneeInteraction(source.companyId, source.id);
+      const placeholderAssignee = isHumanOwnerPlaceholderAgent(sourceAssignee);
+      if (!hasLiveInteraction && !placeholderAssignee) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const reason = hasLiveInteraction
+        ? "live-path: interaction"
+        : "human-owner placeholder assignee";
+
+      const sourceBlockerIds = await existingBlockerIssueIds(source.companyId, source.id);
+      if (sourceBlockerIds.includes(recovery.id)) {
+        await issuesSvc.update(source.id, {
+          blockedByIssueIds: sourceBlockerIds.filter((id) => id !== recovery.id),
+        });
+        result.blockerRelationsRemoved += 1;
+      }
+
+      const prefix = await getCompanyIssuePrefix(recovery.companyId);
+      await issuesSvc.addComment(
+        recovery.id,
+        [
+          "Paperclip reaped this false-positive stranded recovery issue.",
+          "",
+          `- Source: ${issueUiLink({ identifier: source.identifier, id: source.id }, prefix)}`,
+          `- Reason: ${reason}`,
+          sourceAssignee
+            ? `- Source assignee: ${agentUiLink(sourceAssignee, prefix)} (adapter=\`${sourceAssignee.adapterType}\`, status=\`${sourceAssignee.status}\`)`
+            : "- Source assignee: none",
+          "- Action: recovery cancelled; the source has a first-class live path that does not require an automated recovery owner.",
+        ].join("\n"),
+        {},
+      );
+
+      await issuesSvc.update(recovery.id, { status: "cancelled" });
+
+      await logActivity(db, {
+        companyId: recovery.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.stranded_recovery_reaped",
+        entityType: "issue",
+        entityId: recovery.id,
+        details: {
+          recoveryIssueId: recovery.id,
+          recoveryIdentifier: recovery.identifier,
+          sourceIssueId: source.id,
+          sourceIdentifier: source.identifier,
+          reason,
+          hadBlockerRelation: sourceBlockerIds.includes(recovery.id),
+        },
+      });
+
+      logger.info(
+        {
+          companyId: recovery.companyId,
+          recoveryIssueId: recovery.id,
+          sourceIssueId: source.id,
+          reason,
+        },
+        "recovery: reaped (false-positive stranded recovery)",
+      );
+
+      result.reaped += 1;
+      result.reapedIssueIds.push(recovery.id);
+    }
+
+    return result;
+  }
+
   async function reconcileStrandedAssignedIssues() {
+    const reaperResult = await reapFalsePositiveStrandedRecoveryIssues();
+
     const candidates = await db
       .select()
       .from(issues)
@@ -1803,7 +1986,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulRunHandoffEscalated: 0,
       escalated: 0,
       skipped: 0,
-      issueIds: [] as string[],
+      reapedFalsePositiveRecoveries: reaperResult.reaped,
+      reapedRecoveryBlockerRelationsRemoved: reaperResult.blockerRelationsRemoved,
+      issueIds: [...reaperResult.reapedIssueIds],
     };
 
     for (const issue of candidates) {
@@ -1820,6 +2005,57 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (await hasActiveExecutionPath(issue.companyId, issue.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasPendingWakeAssigneeInteraction(issue.companyId, issue.id)) {
+        logger.info(
+          {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            assigneeAgentId: agentId,
+          },
+          "recovery: skipped (live-path: interaction)",
+        );
+        result.skipped += 1;
+        continue;
+      }
+
+      if (isHumanOwnerPlaceholderAgent(agent)) {
+        logger.info(
+          {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            assigneeAgentId: agentId,
+            adapterType: agent.adapterType,
+            agentStatus: agent.status,
+          },
+          "recovery: skipped (human-owner placeholder assignee)",
+        );
+        result.skipped += 1;
+        continue;
+      }
+
+      const recentlyClosed = !isStrandedIssueRecoveryIssue(issue)
+        ? await findRecentlyClosedStrandedIssueRecoveryIssue(
+            issue.companyId,
+            issue.id,
+            STRANDED_RECOVERY_REOPEN_COOLDOWN_MS,
+          )
+        : null;
+      if (recentlyClosed) {
+        logger.info(
+          {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            priorRecoveryIssueId: recentlyClosed.id,
+            priorRecoveryStatus: recentlyClosed.status,
+            priorRecoveryUpdatedAt: recentlyClosed.updatedAt,
+            cooldownMs: STRANDED_RECOVERY_REOPEN_COOLDOWN_MS,
+          },
+          "recovery: skipped (cooldown: recent close)",
+        );
         result.skipped += 1;
         continue;
       }
@@ -2834,6 +3070,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recordWatchdogDecision,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
+    reapFalsePositiveStrandedRecoveryIssues,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,

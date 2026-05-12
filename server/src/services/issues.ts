@@ -67,7 +67,10 @@ import {
   issueTreeControlService,
   type ActiveIssueTreePauseHoldGate,
 } from "./issue-tree-control.js";
-import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
+import {
+  isStrandedIssueRecoveryOriginKind,
+  parseIssueGraphLivenessIncidentKey,
+} from "./recovery/origins.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -2808,7 +2811,13 @@ export function issueService(db: Db) {
 
     listWakeableBlockedDependents: async (blockerIssueId: string) => {
       const blockerIssue = await db
-        .select({ id: issues.id, companyId: issues.companyId })
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          originKind: issues.originKind,
+          originId: issues.originId,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
         .from(issues)
         .where(eq(issues.id, blockerIssueId))
         .then((rows) => rows[0] ?? null);
@@ -2855,7 +2864,7 @@ export function issueService(db: Db) {
         blockersByIssueId.set(row.issueId, list);
       }
 
-      return candidates
+      const dependents = candidates
         .filter((candidate) => candidate.assigneeAgentId && !["backlog", "done", "cancelled"].includes(candidate.status))
         .map((candidate) => {
           const blockers = blockersByIssueId.get(candidate.id) ?? [];
@@ -2865,12 +2874,42 @@ export function issueService(db: Db) {
             allBlockersDone: blockers.length > 0 && blockers.every((blocker) => blocker.blockerStatus === "done"),
           };
         })
-        .filter((candidate) => candidate.allBlockersDone)
-        .map((candidate) => ({
+        .filter((candidate) => candidate.allBlockersDone);
+
+      if (dependents.length === 0) return [];
+
+      const assigneeAgentIds = Array.from(
+        new Set(dependents.map((dependent) => dependent.assigneeAgentId).filter((value): value is string => Boolean(value))),
+      );
+      const blockerIsStrandedRecovery = isStrandedIssueRecoveryOriginKind(blockerIssue.originKind);
+      const recoveryOwnerAgentId = blockerIsStrandedRecovery ? blockerIssue.assigneeAgentId : null;
+      const assigneeAgentRows = assigneeAgentIds.length > 0
+        ? await db
+            .select({ id: agents.id, adapterType: agents.adapterType, status: agents.status })
+            .from(agents)
+            .where(inArray(agents.id, assigneeAgentIds))
+        : [];
+      const assigneeAgentMap = new Map(assigneeAgentRows.map((row) => [row.id, row]));
+
+      return dependents.map((candidate) => {
+        const assignee = assigneeAgentMap.get(candidate.assigneeAgentId!);
+        const assigneeBroken = Boolean(
+          assignee && assignee.adapterType === "process" && assignee.status === "error",
+        );
+        const wakeAgentId = blockerIsStrandedRecovery &&
+          assigneeBroken &&
+          recoveryOwnerAgentId &&
+          recoveryOwnerAgentId !== candidate.assigneeAgentId
+          ? recoveryOwnerAgentId
+          : candidate.assigneeAgentId!;
+        return {
           id: candidate.id,
           assigneeAgentId: candidate.assigneeAgentId!,
+          wakeAgentId,
           blockerIssueIds: candidate.blockerIssueIds,
-        }));
+          reroutedToRecoveryOwner: wakeAgentId !== candidate.assigneeAgentId,
+        };
+      });
     },
 
     getWakeableParentAfterChildCompletion: async (parentIssueId: string) => {
@@ -3898,6 +3937,124 @@ export function issueService(db: Db) {
             checkoutRunId: existing.checkoutRunId,
             executionRunId: existing.executionRunId,
           },
+        };
+      }),
+
+    adminRecoveryTakeover: async (input: {
+      sourceIssueId: string;
+      recoveryIssueId: string;
+      newAssigneeAgentId: string;
+      actor: { agentId?: string | null; userId?: string | null };
+    }) =>
+      db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} in (${input.sourceIssueId}, ${input.recoveryIssueId}) order by ${issues.id} for update`,
+        );
+
+        const source = await tx
+          .select()
+          .from(issues)
+          .where(eq(issues.id, input.sourceIssueId))
+          .then((rows) => rows[0] ?? null);
+        if (!source) return { error: "source_not_found" as const };
+
+        const recovery = await tx
+          .select()
+          .from(issues)
+          .where(eq(issues.id, input.recoveryIssueId))
+          .then((rows) => rows[0] ?? null);
+        if (!recovery) return { error: "recovery_not_found" as const };
+
+        if (recovery.companyId !== source.companyId) {
+          return { error: "company_mismatch" as const };
+        }
+        if (recovery.originId !== source.id) {
+          return { error: "recovery_not_for_source" as const };
+        }
+        if (!isStrandedIssueRecoveryOriginKind(recovery.originKind)) {
+          return { error: "recovery_origin_invalid" as const };
+        }
+
+        const newAssignee = await tx
+          .select({ id: agents.id, companyId: agents.companyId })
+          .from(agents)
+          .where(eq(agents.id, input.newAssigneeAgentId))
+          .then((rows) => rows[0] ?? null);
+        if (!newAssignee || newAssignee.companyId !== source.companyId) {
+          return { error: "assignee_invalid" as const };
+        }
+
+        await tx
+          .delete(issueRelations)
+          .where(
+            and(
+              eq(issueRelations.companyId, source.companyId),
+              eq(issueRelations.relatedIssueId, source.id),
+              eq(issueRelations.issueId, recovery.id),
+              eq(issueRelations.type, "blocks"),
+            ),
+          );
+
+        const remainingBlockerRows = await tx
+          .select({ blockerIssueId: issueRelations.issueId, status: issues.status })
+          .from(issueRelations)
+          .innerJoin(
+            issues,
+            and(
+              eq(issues.companyId, issueRelations.companyId),
+              eq(issues.id, issueRelations.issueId),
+            ),
+          )
+          .where(
+            and(
+              eq(issueRelations.companyId, source.companyId),
+              eq(issueRelations.relatedIssueId, source.id),
+              eq(issueRelations.type, "blocks"),
+            ),
+          );
+        const unresolvedRemaining = remainingBlockerRows.filter(
+          (row) => !["done", "cancelled"].includes(row.status),
+        );
+
+        const previousStatus = source.status;
+        const previousAssigneeAgentId = source.assigneeAgentId;
+        const previousCheckoutRunId = source.checkoutRunId;
+        const previousExecutionRunId = source.executionRunId;
+
+        const nextStatus = previousStatus === "blocked" && unresolvedRemaining.length === 0
+          ? "todo"
+          : previousStatus;
+
+        const patch: Partial<typeof issues.$inferInsert> = {
+          assigneeAgentId: input.newAssigneeAgentId,
+          assigneeUserId: null,
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          status: nextStatus,
+          updatedAt: new Date(),
+        };
+
+        const updated = await tx
+          .update(issues)
+          .set(patch)
+          .where(eq(issues.id, source.id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) return { error: "update_failed" as const };
+
+        const [enriched] = await withIssueLabels(tx, [updated]);
+        return {
+          ok: true as const,
+          issue: enriched,
+          previous: {
+            status: previousStatus,
+            assigneeAgentId: previousAssigneeAgentId,
+            checkoutRunId: previousCheckoutRunId,
+            executionRunId: previousExecutionRunId,
+          },
+          recoveryIssueId: recovery.id,
         };
       }),
 

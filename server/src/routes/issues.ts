@@ -3325,7 +3325,7 @@ export function issueRoutes(
       if (becameDone) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
-          addWakeup(dependent.assigneeAgentId, {
+          addWakeup(dependent.wakeAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "issue_blockers_resolved",
@@ -3333,6 +3333,9 @@ export function issueRoutes(
               issueId: dependent.id,
               resolvedBlockerIssueId: issue.id,
               blockerIssueIds: dependent.blockerIssueIds,
+              ...(dependent.reroutedToRecoveryOwner
+                ? { reroutedFromAssigneeAgentId: dependent.assigneeAgentId }
+                : {}),
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
@@ -3343,6 +3346,9 @@ export function issueRoutes(
               source: "issue.blockers_resolved",
               resolvedBlockerIssueId: issue.id,
               blockerIssueIds: dependent.blockerIssueIds,
+              ...(dependent.reroutedToRecoveryOwner
+                ? { reroutedFromAssigneeAgentId: dependent.assigneeAgentId }
+                : {}),
             },
           });
         }
@@ -3586,6 +3592,136 @@ export function issueRoutes(
 
     res.json(result);
   });
+
+  router.post(
+    "/issues/:id/admin/recovery-takeover",
+    validate(
+      z.object({
+        recoveryIssueId: z.string().uuid(),
+        newAssigneeAgentId: z.string().uuid().optional(),
+      }),
+    ),
+    async (req, res) => {
+      const sourceId = req.params.id as string;
+      const source = await svc.getById(sourceId);
+      if (!source) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      assertCompanyAccess(req, source.companyId);
+
+      const recoveryIssueId = req.body.recoveryIssueId as string;
+      const recovery = await svc.getById(recoveryIssueId);
+      if (!recovery) {
+        res.status(404).json({ error: "Recovery issue not found" });
+        return;
+      }
+      if (recovery.companyId !== source.companyId) {
+        res.status(403).json({ error: "Recovery issue is in a different company" });
+        return;
+      }
+      if (recovery.originId !== source.id || recovery.originKind !== "stranded_issue_recovery") {
+        res.status(422).json({ error: "Recovery issue does not belong to this source issue" });
+        return;
+      }
+
+      const actorAgentId = req.actor.type === "agent" ? req.actor.agentId : null;
+      const isBoard = req.actor.type === "board";
+
+      if (!isBoard) {
+        if (!actorAgentId) {
+          res.status(403).json({ error: "Recovery takeover requires board or recovery-owner agent context" });
+          return;
+        }
+        if (recovery.assigneeAgentId !== actorAgentId) {
+          res.status(403).json({
+            error: "Only the recovery owner may take over its source issue",
+            details: {
+              recoveryIssueId,
+              recoveryAssigneeAgentId: recovery.assigneeAgentId,
+              actorAgentId,
+            },
+          });
+          return;
+        }
+      }
+
+      const requestedAssignee = (req.body.newAssigneeAgentId as string | undefined) ?? null;
+      const newAssigneeAgentId = requestedAssignee ?? recovery.assigneeAgentId;
+      if (!newAssigneeAgentId) {
+        res.status(422).json({ error: "Recovery owner is unassigned; specify newAssigneeAgentId" });
+        return;
+      }
+
+      const actor = getActorInfo(req);
+      const result = await svc.adminRecoveryTakeover({
+        sourceIssueId: sourceId,
+        recoveryIssueId,
+        newAssigneeAgentId,
+        actor: {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      });
+
+      if ("error" in result) {
+        const status = result.error === "source_not_found" || result.error === "recovery_not_found"
+          ? 404
+          : 422;
+        res.status(status).json({ error: result.error });
+        return;
+      }
+
+      await logActivity(db, {
+        companyId: result.issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.admin_recovery_takeover",
+        entityType: "issue",
+        entityId: result.issue.id,
+        details: {
+          issueId: result.issue.id,
+          recoveryIssueId: result.recoveryIssueId,
+          previousStatus: result.previous.status,
+          previousAssigneeAgentId: result.previous.assigneeAgentId,
+          previousCheckoutRunId: result.previous.checkoutRunId,
+          previousExecutionRunId: result.previous.executionRunId,
+          newAssigneeAgentId,
+        },
+      });
+
+      heartbeat
+        .wakeup(newAssigneeAgentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: {
+            issueId: result.issue.id,
+            recoveryIssueId: result.recoveryIssueId,
+            mutation: "recovery_takeover",
+          },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: result.issue.id,
+            taskId: result.issue.id,
+            wakeReason: "issue_assigned",
+            source: "issue.admin_recovery_takeover",
+            recoveryIssueId: result.recoveryIssueId,
+          },
+        })
+        .catch((err) =>
+          logger.warn(
+            { err, issueId: result.issue.id, newAssigneeAgentId },
+            "failed to wake new assignee after recovery takeover",
+          ),
+        );
+
+      res.json(result);
+    },
+  );
 
   router.get("/issues/:id/comments", async (req, res) => {
     const id = req.params.id as string;
